@@ -168,6 +168,177 @@ class PredictResponse(BaseModel):
 print("Loading model...")
 
 # Disease keywords
+# keywords_extractor.py
+from collections import Counter, defaultdict
+import pandas as pd
+import re
+
+try:
+    from underthesea import word_tokenize
+    def vn_tokenize(text: str):
+        return word_tokenize(text.lower())
+except Exception:
+    def vn_tokenize(text: str):
+        return text.lower().split()
+
+VI_STOPWORDS = {
+    'và', 'của', 'có', 'là', 'được', 'trong', 'với', 'cho', 'từ', 'trên',
+    'theo', 'về', 'như', 'khi', 'nếu', 'để', 'này', 'đó', 'những', 'các',
+    'một', 'hai', 'ba', 'bốn', 'năm', 'sáu', 'bảy', 'tám', 'chín', 'mười',
+    'người', 'bệnh', 'nhân', 'bị', 'cảm', 'thấy', 'triệu', 'chứng', 'dấu',
+    'hiệu', 'tình', 'trạng', 'xuất', 'hiện', 'gặp', 'phải', 'thường',
+    'rất', 'khá', 'hơi', 'một', 'chút', 'ít', 'nhiều', 'lúc', 'khi'
+}
+
+# Một số âm tiết thường gặp để tách nhanh các từ ghép bị dính, ví dụ: "nướctiểu" -> "nước tiểu"
+SYLLABLE_PREFIXES = [
+    'đau', 'khó', 'buồn', 'mệt', 'khát', 'sốt', 'nghẹt', 'chóng',
+    'hoa', 'đói', 'gầy', 'tê', 'cứng', 'sưng', 'khàn', 'nhức',
+    'căng', 'đầy', 'táo', 'lỏng', 'nóng', 'lạnh', 'ớn', 'chua',
+    'nước', 'tiểu', 'phát', 'ban', 'hậu', 'môn', 'xanh', 'xao'
+]
+
+SYMPTOM_HEADS = {
+    "đau", "nhức", "buốt", "rát", "sưng", "viêm", "ngứa",
+    "khô", "nứt", "tê", "mỏi", "cứng", "phù", "chảy",
+    "khó", "bí", "tiêu", "tiết", "ho", "nôn", "buồn", "chóng", "hoa"
+}
+BODY_PARTS = {
+    "bụng", "đầu", "họng", "ngực", "lưng", "cổ", "vai", "gối", "khớp",
+    "da", "mũi", "mắt", "tai", "miệng", "răng", "lưỡi",
+    "dạ dày", "ruột", "phổi", "gan", "thận", "tim"
+}
+FILLER_WORDS = {"nước"}  # để bắt "chảy nước mũi"
+KNOWN_MULTIWORD = {
+    "buồn nôn", "khó thở", "tiêu chảy", "đau rát họng", "đau bụng",
+    "đau đầu", "đầy hơi", "chuột rút", "chảy nước mũi", "khô da",
+    "đau ngực", "đau lưng", "sưng khớp"
+}
+
+
+from collections import Counter, defaultdict
+import re
+
+
+
+def _norm_text(s: str) -> str:
+    s = s.lower()
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _tokens(text: str):
+    # tokenization đã có vn_tokenize ở file của bạn
+    try:
+        return [t for t in vn_tokenize(_norm_text(text)) if t.strip()]
+    except Exception:
+        return _norm_text(text).split()
+
+def _ngram_candidates(tokens):
+    """Sinh candidate bigram/trigram theo luật đơn giản cho triệu chứng."""
+    n = len(tokens)
+    cands = []
+
+    # Bigram: head + body
+    for i in range(n - 1):
+        a, b = tokens[i], tokens[i + 1]
+        if a in SYMPTOM_HEADS and (b in BODY_PARTS or f"{a} {b}" in KNOWN_MULTIWORD):
+            cands.append(f"{a} {b}")
+
+    # Trigram: head + filler + body  (vd: chảy nước mũi)
+    for i in range(n - 2):
+        a, b, c = tokens[i], tokens[i + 1], tokens[i + 2]
+        if a in SYMPTOM_HEADS and b in FILLER_WORDS and c in BODY_PARTS:
+            cands.append(f"{a} {b} {c}")
+
+    return cands
+
+def _match_known_phrases(raw_text: str):
+    """Bắt các cụm đã biết trực tiếp từ text (regex chặt để tránh ăn nhầm)."""
+    text = _norm_text(raw_text)
+    hits = []
+    for phrase in KNOWN_MULTIWORD:
+        # word-boundary đơn giản cho tiếng Việt (dựa trên khoảng trắng/dấu đầu-cuối)
+        if re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", text):
+            hits.append(phrase)
+    return hits
+
+def _select_top_phrases(counts: Counter, max_keywords: int):
+    """Ưu tiên cụm dài hơn, loại các mục là 'substring' của mục đã chọn."""
+    # sắp theo (độ dài từ, tần suất) giảm dần
+    items = sorted(counts.items(), key=lambda kv: (len(kv[0].split()), kv[1]), reverse=True)
+    selected = []
+    for phrase, _ in items:
+        if all(phrase not in big and not big.startswith(phrase + " ") for big in selected):
+            selected.append(phrase)
+        if len(selected) >= max_keywords:
+            break
+    return selected
+
+def extract_keywords_from_symptoms(disease_data, max_keywords: int = 8):
+    """
+    Trích xuất keyword cho mỗi bệnh, ưu tiên cụm triệu chứng đa từ (bigram/trigram).
+    - Bắt cụm kiểu: 'đau bụng', 'khô da', 'sưng khớp', 'chảy nước mũi', ...
+    - Giữ cụm dài, tránh trùng lặp với token con.
+    """
+    print("Đang trích xuất từ khóa...")
+    disease_symptoms = defaultdict(list)
+    for symptom, disease in disease_data:
+        disease_symptoms[disease].append(str(symptom))
+
+    disease_keywords = {}
+    for disease, symptoms in disease_symptoms.items():
+        phrase_counter = Counter()
+
+        for s in symptoms:
+            # 1) match các cụm đã biết
+            for p in _match_known_phrases(s):
+                phrase_counter[p] += 1
+
+            # 2) sinh candidate theo luật head/body
+            toks = _tokens(s)
+            for p in _ngram_candidates(toks):
+                phrase_counter[p] += 1
+
+        # 3) fallback: nếu thiếu cụm, bổ sung một số đơn từ (ít) có nghĩa
+        if len(phrase_counter) < max_keywords:
+            # thêm đơn từ meaningful (head/body) xuất hiện trong tokens
+            unigram_counts = Counter()
+            for s in symptoms:
+                toks = _tokens(s)
+                for t in toks:
+                    if t in SYMPTOM_HEADS or t in BODY_PARTS:
+                        unigram_counts[t] += 1
+            # gộp thêm một số đơn từ (không lấn át cụm)
+            for w, c in unigram_counts.most_common(max(0, max_keywords - len(phrase_counter))):
+                if w not in phrase_counter:
+                    phrase_counter[w] = c
+
+        # 4) chọn top, ưu tiên cụm dài
+        top_keywords = _select_top_phrases(phrase_counter, max_keywords)
+        disease_keywords[disease] = top_keywords
+        print(f"{disease}: {len(symptoms)} triệu chứng -> {len(top_keywords)} từ khóa")
+
+    return disease_keywords
+
+
+def load_disease_data_from_csv(csv_path: str):
+    """
+    Đọc CSV và lấy cột 0 (bệnh), cột 2 (triệu chứng).
+    Trả về list các tuple (symptom_text, disease_label).
+    """
+    df = pd.read_csv(csv_path)
+    df = df.iloc[:, [0, 2]]
+    df.columns = ['benh', 'trieu_chung']
+    df = df.dropna()
+    df['benh'] = df['benh'].astype(str).str.replace(' ', '_')
+    disease_data = [(str(row['trieu_chung']), str(row['benh'])) for _, row in df.iterrows()]
+    return disease_data
+
+
+excel_path = "./data_processed/augmented_medical_data.csv"
+disease_data = load_disease_data_from_csv(excel_path)
+disease_keywords = extract_keywords_from_symptoms(disease_data, max_keywords=8)
+
 
 # Initialize label encoder
 label_encoder = LabelEncoder()
