@@ -68,11 +68,10 @@ Mô hình được fine-tune trên các tập dữ liệu có nhãn bệnh cụ 
       cd Pretrain_VihealthBert_DiseaseClassifier
       pip install -r requirements.txt
       
-      # Tạo mô hình, fine-tune
-      python train.py --config config/train_config.yaml
+      # Chạy FastApi.py
+      uvicorn FastApi:app --host 0.0.0.0 --port 8000 --reload
       
-      # Kiểm thử mô hình
-      python infer.py --model models/latest_model.pt --input "sốt, đau họng, mệt mỏi"
+      
 
 ### Trích dẫn ViHealthBERT:
  https://github.com/demdecuong/vihealthbert/blob/main/README.md
