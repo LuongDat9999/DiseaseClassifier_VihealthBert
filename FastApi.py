@@ -1,21 +1,20 @@
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 from sklearn.preprocessing import LabelEncoder
 import numpy as np
-from underthesea import word_tokenize
+from pyvi import ViTokenizer
 import warnings
 warnings.filterwarnings('ignore')
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from fastapi.middleware.cors import CORSMiddleware
 from typing import List
 import uvicorn
 import re
 import threading
 import time
+
 from huggingface_hub import hf_hub_download
 
 # Set random seeds for reproducibility
@@ -99,7 +98,7 @@ def preprocess_text(text):
     if isinstance(text, str):
         try:
             # Word tokenization for Vietnamese
-            segmented = word_tokenize(text, format="text")
+            segmented = ViTokenizer.tokenize(text)
             return segmented.strip()
         except Exception as e:
             print(f"Error in text preprocessing: {e}")
@@ -130,212 +129,10 @@ def predict_disease(model, tokenizer, label_encoder, text, device, max_length=25
     top_probs = probs[top_indices]
     return top_labels, top_probs, probs
 
-def predict_disease_with_rules(text, disease_keywords, label_encoder):
-    input_words = set(preprocess_text(text).lower().split())
-    scores = []
-    for label in label_encoder.classes_:
-        keywords = set(disease_keywords.get(label, []))
-        score = len(input_words & keywords) / (len(keywords) or 1)
-        scores.append(score)
-    return np.array(scores)
-
-def hybrid_predict(model, tokenizer, label_encoder, text, device, disease_keywords, max_length=256, top_k=3, alpha=0.7):
-    # Model prediction
-    top_labels, top_probs, probs = predict_disease(model, tokenizer, label_encoder, text, device, max_length, top_k=len(label_encoder.classes_))
-    # Rule-based prediction
-    rule_scores = predict_disease_with_rules(text, disease_keywords, label_encoder)
-    # Weighted sum
-    combined = alpha * probs + (1 - alpha) * rule_scores
-    top_indices = np.argsort(combined)[::-1][:top_k]
-    top_labels = label_encoder.inverse_transform(top_indices)
-    top_scores = combined[top_indices]
-    return top_labels, top_scores, combined
 
 # Hàm chuyển tên bệnh sang dạng tự nhiên
 def beautify_label(label: str) -> str:
     return re.sub(r'_+', ' ', label).strip()
-
-# Định nghĩa request/response schema
-class PredictRequest(BaseModel):
-    text: str
-
-class DiseasePrediction(BaseModel):
-    disease: str
-    confidence: float
-
-class PredictResponse(BaseModel):
-    predictions: List[DiseasePrediction]
-
-# Load model
-print("Loading model...")
-
-# Disease keywords
-# keywords_extractor.py
-from collections import Counter, defaultdict
-import pandas as pd
-import re
-
-try:
-    from underthesea import word_tokenize
-    def vn_tokenize(text: str):
-        return word_tokenize(text.lower())
-except Exception:
-    def vn_tokenize(text: str):
-        return text.lower().split()
-
-VI_STOPWORDS = {
-    'và', 'của', 'có', 'là', 'được', 'trong', 'với', 'cho', 'từ', 'trên',
-    'theo', 'về', 'như', 'khi', 'nếu', 'để', 'này', 'đó', 'những', 'các',
-    'một', 'hai', 'ba', 'bốn', 'năm', 'sáu', 'bảy', 'tám', 'chín', 'mười',
-    'người', 'bệnh', 'nhân', 'bị', 'cảm', 'thấy', 'triệu', 'chứng', 'dấu',
-    'hiệu', 'tình', 'trạng', 'xuất', 'hiện', 'gặp', 'phải', 'thường',
-    'rất', 'khá', 'hơi', 'một', 'chút', 'ít', 'nhiều', 'lúc', 'khi'
-}
-
-# Một số âm tiết thường gặp để tách nhanh các từ ghép bị dính, ví dụ: "nướctiểu" -> "nước tiểu"
-SYLLABLE_PREFIXES = [
-    'đau', 'khó', 'buồn', 'mệt', 'khát', 'sốt', 'nghẹt', 'chóng',
-    'hoa', 'đói', 'gầy', 'tê', 'cứng', 'sưng', 'khàn', 'nhức',
-    'căng', 'đầy', 'táo', 'lỏng', 'nóng', 'lạnh', 'ớn', 'chua',
-    'nước', 'tiểu', 'phát', 'ban', 'hậu', 'môn', 'xanh', 'xao'
-]
-
-SYMPTOM_HEADS = {
-    "đau", "nhức", "buốt", "rát", "sưng", "viêm", "ngứa",
-    "khô", "nứt", "tê", "mỏi", "cứng", "phù", "chảy",
-    "khó", "bí", "tiêu", "tiết", "ho", "nôn", "buồn", "chóng", "hoa"
-}
-BODY_PARTS = {
-    "bụng", "đầu", "họng", "ngực", "lưng", "cổ", "vai", "gối", "khớp",
-    "da", "mũi", "mắt", "tai", "miệng", "răng", "lưỡi",
-    "dạ dày", "ruột", "phổi", "gan", "thận", "tim"
-}
-FILLER_WORDS = {"nước"}  # để bắt "chảy nước mũi"
-KNOWN_MULTIWORD = {
-    "buồn nôn", "khó thở", "tiêu chảy", "đau rát họng", "đau bụng",
-    "đau đầu", "đầy hơi", "chuột rút", "chảy nước mũi", "khô da",
-    "đau ngực", "đau lưng", "sưng khớp"
-}
-
-
-from collections import Counter, defaultdict
-import re
-
-
-
-def _norm_text(s: str) -> str:
-    s = s.lower()
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def _tokens(text: str):
-    # tokenization đã có vn_tokenize ở file của bạn
-    try:
-        return [t for t in vn_tokenize(_norm_text(text)) if t.strip()]
-    except Exception:
-        return _norm_text(text).split()
-
-def _ngram_candidates(tokens):
-    """Sinh candidate bigram/trigram theo luật đơn giản cho triệu chứng."""
-    n = len(tokens)
-    cands = []
-
-    # Bigram: head + body
-    for i in range(n - 1):
-        a, b = tokens[i], tokens[i + 1]
-        if a in SYMPTOM_HEADS and (b in BODY_PARTS or f"{a} {b}" in KNOWN_MULTIWORD):
-            cands.append(f"{a} {b}")
-
-    # Trigram: head + filler + body  (vd: chảy nước mũi)
-    for i in range(n - 2):
-        a, b, c = tokens[i], tokens[i + 1], tokens[i + 2]
-        if a in SYMPTOM_HEADS and b in FILLER_WORDS and c in BODY_PARTS:
-            cands.append(f"{a} {b} {c}")
-
-    return cands
-
-def _match_known_phrases(raw_text: str):
-    """Bắt các cụm đã biết trực tiếp từ text (regex chặt để tránh ăn nhầm)."""
-    text = _norm_text(raw_text)
-    hits = []
-    for phrase in KNOWN_MULTIWORD:
-        # word-boundary đơn giản cho tiếng Việt (dựa trên khoảng trắng/dấu đầu-cuối)
-        if re.search(rf"(?<!\w){re.escape(phrase)}(?!\w)", text):
-            hits.append(phrase)
-    return hits
-
-def _select_top_phrases(counts: Counter, max_keywords: int):
-    """Ưu tiên cụm dài hơn, loại các mục là 'substring' của mục đã chọn."""
-    # sắp theo (độ dài từ, tần suất) giảm dần
-    items = sorted(counts.items(), key=lambda kv: (len(kv[0].split()), kv[1]), reverse=True)
-    selected = []
-    for phrase, _ in items:
-        if all(phrase not in big and not big.startswith(phrase + " ") for big in selected):
-            selected.append(phrase)
-        if len(selected) >= max_keywords:
-            break
-    return selected
-
-def extract_keywords_from_symptoms(disease_data, max_keywords: int = 8):
-    """
-    Trích xuất keyword cho mỗi bệnh, ưu tiên cụm triệu chứng đa từ (bigram/trigram).
-    - Bắt cụm kiểu: 'đau bụng', 'khô da', 'sưng khớp', 'chảy nước mũi', ...
-    - Giữ cụm dài, tránh trùng lặp với token con.
-    """
-    print("Đang trích xuất từ khóa...")
-    disease_symptoms = defaultdict(list)
-    for symptom, disease in disease_data:
-        disease_symptoms[disease].append(str(symptom))
-
-    disease_keywords = {}
-    for disease, symptoms in disease_symptoms.items():
-        phrase_counter = Counter()
-
-        for s in symptoms:
-            # 1) match các cụm đã biết
-            for p in _match_known_phrases(s):
-                phrase_counter[p] += 1
-
-            # 2) sinh candidate theo luật head/body
-            toks = _tokens(s)
-            for p in _ngram_candidates(toks):
-                phrase_counter[p] += 1
-
-        # 3) fallback: nếu thiếu cụm, bổ sung một số đơn từ (ít) có nghĩa
-        if len(phrase_counter) < max_keywords:
-            # thêm đơn từ meaningful (head/body) xuất hiện trong tokens
-            unigram_counts = Counter()
-            for s in symptoms:
-                toks = _tokens(s)
-                for t in toks:
-                    if t in SYMPTOM_HEADS or t in BODY_PARTS:
-                        unigram_counts[t] += 1
-            # gộp thêm một số đơn từ (không lấn át cụm)
-            for w, c in unigram_counts.most_common(max(0, max_keywords - len(phrase_counter))):
-                if w not in phrase_counter:
-                    phrase_counter[w] = c
-
-        # 4) chọn top, ưu tiên cụm dài
-        top_keywords = _select_top_phrases(phrase_counter, max_keywords)
-        disease_keywords[disease] = top_keywords
-        print(f"{disease}: {len(symptoms)} triệu chứng -> {len(top_keywords)} từ khóa")
-
-    return disease_keywords
-
-
-def load_disease_data_from_csv(csv_path: str):
-    """
-    Đọc CSV và lấy cột 0 (bệnh), cột 2 (triệu chứng).
-    Trả về list các tuple (symptom_text, disease_label).
-    """
-    df = pd.read_csv(csv_path)
-    df = df.iloc[:, [0, 2]]
-    df.columns = ['benh', 'trieu_chung']
-    df = df.dropna()
-    df['benh'] = df['benh'].astype(str).str.replace(' ', '_')
-    disease_data = [(str(row['trieu_chung']), str(row['benh'])) for _, row in df.iterrows()]
-    return disease_data
-
 
 # ==== Khai báo schema ====
 class PredictRequest(BaseModel):
@@ -375,18 +172,14 @@ disease_keywords = None
 def load_assets():
     global model, tokenizer, label_encoder, disease_keywords
     try:
-        excel_path = "./data_processed/augmented_medical_data.csv"
-        disease_data = load_disease_data_from_csv(excel_path)
-        disease_keywords = extract_keywords_from_symptoms(disease_data, max_keywords=8)
-
+        # Load model
+        print("Loading model...")
 
         # Initialize label encoder
         label_encoder = LabelEncoder()
         label_encoder.fit(list(disease_keywords.keys()))
 
-        # Load model checkpoint
-
-
+        # Load model checkpoint 
         path_checkpoint = hf_hub_download(
             repo_id="LuongDat/heath_api",
             filename="vihealthbert_disease_model.pth"
@@ -411,7 +204,6 @@ def load_assets():
     except Exception as e:
         # Nếu fail, vẫn cho /health báo lỗi
         print(f"[startup] Failed to load model/tokenizer: {e}")
-
 
 @app.get("/")
 async def root():
@@ -443,9 +235,8 @@ async def predict(request: PredictRequest):
             raise HTTPException(status_code=400, detail="Text cannot be empty")
 
         # Get top 2 predictions
-        top_labels, top_scores, _ = hybrid_predict(
-            model, tokenizer, label_encoder, text, device, disease_keywords,
-            max_length=256, top_k=2, alpha=0.7
+        top_labels, top_scores, _ = predict_disease(
+            model, tokenizer, label_encoder, test_text, device, max_length=256, top_k=2
         )
 
         predictions = [
