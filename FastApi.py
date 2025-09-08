@@ -10,11 +10,13 @@ import warnings
 warnings.filterwarnings('ignore')
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 from typing import List
 import uvicorn
 import re
 import threading
 import time
+from huggingface_hub import hf_hub_download
 
 # Set random seeds for reproducibility
 torch.manual_seed(42)
@@ -335,38 +337,16 @@ def load_disease_data_from_csv(csv_path: str):
     return disease_data
 
 
-excel_path = "./data_processed/augmented_medical_data.csv"
-disease_data = load_disease_data_from_csv(excel_path)
-disease_keywords = extract_keywords_from_symptoms(disease_data, max_keywords=8)
+# ==== Khai báo schema ====
+class PredictRequest(BaseModel):
+    text: str
 
+class DiseasePrediction(BaseModel):
+    disease: str
+    confidence: float
 
-# Initialize label encoder
-label_encoder = LabelEncoder()
-label_encoder.fit(list(disease_keywords.keys()))
-
-# Load model checkpoint
-from huggingface_hub import hf_hub_download
-
-path_checkpoint = hf_hub_download(
-    repo_id="LuongDat/heath_api",
-    filename="vihealthbert_disease_model.pth"
-)
-
-# Load config and tokenizer
-config = Config()
-tokenizer = AutoTokenizer.from_pretrained(config.model_name)
-vihealthbert = AutoModel.from_pretrained(config.model_name)
-
-# Create model and load trained weights
-model = EnhancedDiseaseClassifier(vihealthbert, len(label_encoder.classes_), config)
-
-checkpoint = torch.load(path_checkpoint, map_location=torch.device('cpu'), weights_only=False)
-model.load_state_dict(checkpoint['model_state_dict'])
-model.eval()
-
-device = torch.device('cpu')
-
-print("Model loaded successfully!")
+class PredictResponse(BaseModel):
+    predictions: List[DiseasePrediction]
 
 # Khởi tạo FastAPI
 app = FastAPI(
@@ -374,6 +354,64 @@ app = FastAPI(
     description="API for predicting diseases from Vietnamese medical text",
     version="1.0.0"
 )
+# Cho phép web .NET gọi (khi production, thay "*" bằng domain cụ thể)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ==== Tài nguyên mô hình (global) ====
+model = None
+tokenizer = None
+label_encoder = None
+device = "cpu"
+disease_keywords = None
+
+# ==== Nạp model 1 lần khi khởi động ====
+@app.on_event("startup")
+def load_assets():
+    global model, tokenizer, label_encoder, disease_keywords
+    try:
+        excel_path = "./data_processed/augmented_medical_data.csv"
+        disease_data = load_disease_data_from_csv(excel_path)
+        disease_keywords = extract_keywords_from_symptoms(disease_data, max_keywords=8)
+
+
+        # Initialize label encoder
+        label_encoder = LabelEncoder()
+        label_encoder.fit(list(disease_keywords.keys()))
+
+        # Load model checkpoint
+
+
+        path_checkpoint = hf_hub_download(
+            repo_id="LuongDat/heath_api",
+            filename="vihealthbert_disease_model.pth"
+        )
+
+        # Load config and tokenizer
+        config = Config()
+        tokenizer = AutoTokenizer.from_pretrained(config.model_name)
+        vihealthbert = AutoModel.from_pretrained(config.model_name)
+
+        # Create model and load trained weights
+        model = EnhancedDiseaseClassifier(vihealthbert, len(label_encoder.classes_), config)
+
+        checkpoint = torch.load(path_checkpoint, map_location=torch.device('cpu'), weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.eval()
+
+        device = torch.device('cpu')
+
+        print("Model loaded successfully!")
+        pass
+    except Exception as e:
+        # Nếu fail, vẫn cho /health báo lỗi
+        print(f"[startup] Failed to load model/tokenizer: {e}")
+
 
 @app.get("/")
 async def root():
@@ -420,19 +458,3 @@ async def predict(request: PredictRequest):
     except Exception as e:
         print(f"Prediction error: {e}")
         raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
-
-# Chạy server trong thread riêng
-def run_server():
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
-
-# Khởi tạo và start thread
-server_thread = threading.Thread(target=run_server, daemon=True)
-server_thread.start()
-
-# Đợi server khởi động
-time.sleep(3)
-
-print("🚀 API is running at: http://localhost:8000")
-print("📚 Documentation at: http://localhost:8000/docs")
-print("🏥 Health check at: http://localhost:8000/health")
-print("✅ Server is running in background. You can now run other cells!")
